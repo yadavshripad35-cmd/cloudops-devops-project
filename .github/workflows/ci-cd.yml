@@ -32,8 +32,10 @@ jobs:
           test -f Dockerfile
           echo "Application files validated successfully"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Setup Docker Buildx
+	uses: docker/setup-bulidx-action@v3
 
       - name: Log in to GitHub Container Registry
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -52,10 +54,13 @@ jobs:
             type=raw,value=latest
             type=sha,format=short
 
-      - name: Build Docker image
+      - name: Build and publish multi-platform Docker Image 
         uses: docker/build-push-action@v6
         with:
           context: .
+	  platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           tags: ${{ steps.meta.outputs.tags }}
+	  labels: ${{ steps.meta.outputs.labels }}
+
           labels: ${{ steps.meta.outputs.labels }}
