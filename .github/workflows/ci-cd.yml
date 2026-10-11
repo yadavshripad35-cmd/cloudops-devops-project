@@ -1,0 +1,37 @@
+name: CloudOps CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-build:
+    name: Validate and Build Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Validate application files
+        run: |
+          test -f app/index.html
+          test -f Dockerfile
+          echo "Application files validated successfully"
+
+      - name: Build Docker image
+        run: |
+          docker build -t cloudops-dashboard:${{ github.sha }} .
+
+      - name: Verify Docker image
+        run: |
+          docker image inspect cloudops-dashboard:${{ github.sha }}
+          echo "Docker image built successfully"
