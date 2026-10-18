@@ -10,23 +10,42 @@ on:
 
 permissions:
   contents: read
-  packages: write
-  id-token: write
 
 jobs:
-  validate-and-build:
-    name: Validate, Build and Deploy
+  validate:
+    name: Validate Application
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
 
       - name: Validate application files
+        shell: bash
         run: |
+          set -euo pipefail
           test -f app/index.html
           test -f Dockerfile
           echo "Application files validated successfully"
+
+  build-and-deploy:
+    name: Build, Publish and Deploy
+    runs-on: ubuntu-latest
+    needs: validate
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -35,7 +54,6 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -49,61 +67,163 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest
-            type=sha,format=short
+            type=sha,format=short,prefix=sha-
 
       - name: Build and publish multi-platform Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
       - name: Configure AWS credentials using GitHub OIDC
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::789559957244:role/CloudOps-GitHubActions-Deploy-Role
           aws-region: us-west-2
 
       - name: Deploy to EC2 using AWS Systems Manager
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
+        env:
+          IMAGE_REF: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
 
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY}:latest"
           INSTANCE_ID="i-0f5a8d49da3b7b6a5"
 
-          cat > /tmp/cloudops-ssm-parameters.json <<EOF
-          {
-            "commands": [
-              "set -e",
-              "sudo docker pull ${IMAGE}",
-              "sudo docker rm -f cloudops-dashboard || true",
-              "sudo docker run -d --name cloudops-dashboard --restart unless-stopped -p 8080:80 ${IMAGE}",
-              "sudo docker ps --filter name=cloudops-dashboard"
-            ]
-          }
-          EOF
+          if [[ "$IMAGE_REF" != *@sha256:* ]]; then
+            echo "ERROR: Invalid image digest."
+            exit 1
+          fi
 
-          COMMAND_ID=$(aws ssm send-command \
+          cat > /tmp/cloudops-deploy.sh <<'REMOTE_SCRIPT'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          IMAGE="IMAGE_REF_PLACEHOLDER"
+          CONTAINER="cloudops-dashboard"
+          PORT_MAPPING="8080:80"
+
+          PREVIOUS_IMAGE="$(sudo docker inspect --format '{{.Image}}' "$CONTAINER" 2>/dev/null || true)"
+
+          echo "Previous image: ${PREVIOUS_IMAGE:-none}"
+          echo "New image: $IMAGE"
+
+          if ! sudo docker pull "$IMAGE"; then
+            echo "ERROR: Image pull failed. Existing deployment remains untouched."
+            exit 1
+          fi
+
+          rollback() {
+            echo "Deployment failed. Attempting rollback."
+
+            sudo docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+
+            if [[ -z "$PREVIOUS_IMAGE" ]]; then
+              echo "ERROR: No previous image available for rollback."
+              return 1
+            fi
+
+            if ! sudo docker run -d \
+              --name "$CONTAINER" \
+              --restart unless-stopped \
+              -p "$PORT_MAPPING" \
+              "$PREVIOUS_IMAGE"; then
+              echo "ERROR: Could not restart the previous image."
+              return 1
+            fi
+
+            for attempt in $(seq 1 12); do
+              if curl -fsS --max-time 3 http://localhost:8080/ >/dev/null; then
+                echo "Rollback successful."
+                return 0
+              fi
+
+              echo "Waiting for rollback health check (${attempt}/12)..."
+              sleep 5
+            done
+
+            echo "ERROR: Rollback health check failed."
+            return 1
+          }
+
+          sudo docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+
+          if ! sudo docker run -d \
+            --name "$CONTAINER" \
+            --restart unless-stopped \
+            -p "$PORT_MAPPING" \
+            "$IMAGE"; then
+            echo "ERROR: New container could not start."
+            rollback || true
+            exit 1
+          fi
+
+          HEALTHY=0
+
+          for attempt in $(seq 1 12); do
+            if curl -fsS --max-time 3 http://localhost:8080/ >/dev/null; then
+              HEALTHY=1
+              break
+            fi
+
+            echo "Waiting for dashboard health check (${attempt}/12)..."
+            sleep 5
+          done
+
+          if [[ "$HEALTHY" -ne 1 ]]; then
+            echo "ERROR: New deployment failed its health check."
+            rollback || true
+            exit 1
+          fi
+
+          echo "Deployment successful."
+          sudo docker ps --filter "name=$CONTAINER"
+          REMOTE_SCRIPT
+
+          python3 - "$IMAGE_REF" <<'PYTHON'
+          import sys
+          from pathlib import Path
+
+          path = Path("/tmp/cloudops-deploy.sh")
+          content = path.read_text()
+          content = content.replace("IMAGE_REF_PLACEHOLDER", sys.argv[1])
+          path.write_text(content)
+          PYTHON
+
+          ENCODED_SCRIPT="$(base64 < /tmp/cloudops-deploy.sh | tr -d '\n')"
+
+          python3 - "$ENCODED_SCRIPT" <<'PYTHON'
+          import json
+          import sys
+          from pathlib import Path
+
+          command = "echo '" + sys.argv[1] + "' | base64 -d | bash"
+
+          Path("/tmp/cloudops-ssm-parameters.json").write_text(
+              json.dumps({"commands": [command]})
+          )
+          PYTHON
+
+          COMMAND_ID="$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name AWS-RunShellScript \
-            --comment "Deploy CloudOps from GitHub Actions" \
+            --comment "Deploy CloudOps with health check and rollback" \
             --parameters file:///tmp/cloudops-ssm-parameters.json \
             --query 'Command.CommandId' \
-            --output text)
+            --output text)"
 
-          echo "SSM Command ID: ${COMMAND_ID}"
+          echo "SSM Command ID: $COMMAND_ID"
 
-          for attempt in $(seq 1 36); do
-            STATUS=$(aws ssm get-command-invocation \
+          for attempt in $(seq 1 120); do
+            STATUS="$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "$INSTANCE_ID" \
               --query 'Status' \
-              --output text 2>/dev/null || true)
+              --output text 2>/dev/null || true)"
 
             echo "Deployment status: ${STATUS:-Pending}"
 
@@ -118,12 +238,12 @@ jobs:
                 exit 0
                 ;;
               Failed|Cancelled|TimedOut|Undeliverable|Terminated)
-                echo "Deployment failed."
+                echo "Deployment failed. SSM output:"
                 aws ssm get-command-invocation \
                   --command-id "$COMMAND_ID" \
                   --instance-id "$INSTANCE_ID" \
-                  --query 'StandardErrorContent' \
-                  --output text || true
+                  --query '{stdout:StandardOutputContent,stderr:StandardErrorContent}' \
+                  --output json || true
                 exit 1
                 ;;
             esac
@@ -131,5 +251,5 @@ jobs:
             sleep 5
           done
 
-          echo "Timed out waiting for deployment."
+          echo "ERROR: Timed out waiting for SSM deployment."
           exit 1
