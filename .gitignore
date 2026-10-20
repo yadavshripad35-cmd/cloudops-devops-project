@@ -4,3 +4,10 @@
 .terraform/
 terraform.tfstate
 terraform.tfstate.backup
+# Terraform local state and working files
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log

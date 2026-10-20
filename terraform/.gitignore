@@ -1,0 +1,8 @@
+# Terraform state and local working files
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
