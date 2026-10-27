@@ -94,7 +94,7 @@ jobs:
 
           INSTANCE_ID="i-0f5a8d49da3b7b6a5"
 
-          if [[ "$IMAGE_REF" != *@sha256:* ]]; then
+          if ! printf "%s\n" "$IMAGE_REF" | grep -Eq "@sha256:[a-f0-9]{64}$"; then
             echo "ERROR: Invalid image digest."
             exit 1
           fi
